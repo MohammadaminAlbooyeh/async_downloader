@@ -8,32 +8,48 @@ import argparse
 from tqdm import tqdm
 import uuid
 
-DOWNLOAD_DIR = "downloads"
+DEFAULT_DOWNLOAD_DIR = "downloads"
 
-async def download_file(session, url, filename=None, chunk_size=8192):
-    """Download a single file asynchronously with progress tracking."""
+async def download_file(session, url, filename=None, chunk_size=8192, progress_callback=None):
+    """Download a single file asynchronously with optional progress callback.
+
+    If `progress_callback` is provided it will be called as:
+        progress_callback(filename, downloaded_bytes, total_bytes)
+    """
     if filename is None:
         filename = os.path.basename(url) or f"download_{uuid.uuid4().hex[:8]}"
     
-    filepath = os.path.join(DOWNLOAD_DIR, filename)
+    filepath = os.path.join(download_dir_global, filename) if 'download_dir_global' in globals() else os.path.join(DEFAULT_DOWNLOAD_DIR, filename)
     
     try:
         async with session.get(url) as response:
             response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
+            total_size = int(response.headers.get('content-length', 0) or 0)
             
-            with open(filepath, 'wb') as f, tqdm(
-                desc=filename,
-                total=total_size,
-                unit='B',
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as pbar:
-                downloaded = 0
-                async for chunk in response.content.iter_chunked(chunk_size):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    pbar.update(len(chunk))
+            downloaded = 0
+            # If a progress callback is provided, use it; otherwise use tqdm for CLI feedback
+            if progress_callback is None:
+                with open(filepath, 'wb') as f, tqdm(
+                    desc=filename,
+                    total=total_size,
+                    unit='B',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                ) as pbar:
+                    async for chunk in response.content.iter_chunked(chunk_size):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        pbar.update(len(chunk))
+            else:
+                with open(filepath, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(chunk_size):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        try:
+                            progress_callback(filename, downloaded, total_size)
+                        except Exception:
+                            # swallow progress callback errors
+                            pass
         
         return filepath
     except Exception as e:
@@ -42,16 +58,36 @@ async def download_file(session, url, filename=None, chunk_size=8192):
             os.remove(filepath)
         raise e
 
-async def download_multiple_files(urls, max_concurrent=5, chunk_size=8192):
-    """Download multiple files concurrently."""
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+async def download_multiple_files(urls, max_concurrent=5, chunk_size=8192, download_dir=None, progress_callback=None, status_callback=None):
+    """Download multiple files concurrently with optional callbacks.
+
+    - progress_callback(filename, downloaded_bytes, total_bytes)
+    - status_callback(filename, status, info) where status is 'completed' or 'failed' and info is filepath or error message
+    """
+    global download_dir_global
+    download_dir_global = download_dir or DEFAULT_DOWNLOAD_DIR
+    os.makedirs(download_dir_global, exist_ok=True)
     
     semaphore = asyncio.Semaphore(max_concurrent)
     
     async def download_with_semaphore(url):
         async with semaphore:
             filename = os.path.basename(url) or f"download_{uuid.uuid4().hex[:8]}"
-            return await download_file(session, url, filename, chunk_size)
+            try:
+                filepath = await download_file(session, url, filename, chunk_size, progress_callback)
+                if status_callback:
+                    try:
+                        status_callback(filename, 'completed', filepath)
+                    except Exception:
+                        pass
+                return filepath
+            except Exception as e:
+                if status_callback:
+                    try:
+                        status_callback(filename, 'failed', str(e))
+                    except Exception:
+                        pass
+                return e
     
     async with aiohttp.ClientSession() as session:
         tasks = [download_with_semaphore(url) for url in urls]
