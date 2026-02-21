@@ -4,7 +4,7 @@ import queue
 import time
 import os
 import asyncio
-from async_downloader import download_multiple_files
+from async_downloader import download_multiple_files, is_url_downloadable, configure_logging
 
 st.set_page_config(page_title="Async Downloader", layout="wide")
 
@@ -46,7 +46,12 @@ with right_col:
     download_dir = st.text_input("Download directory", value="downloads")
     max_concurrent = st.number_input("Max concurrent downloads", min_value=1, value=5)
     chunk_size = st.number_input("Chunk size (bytes)", min_value=1024, value=8192)
+    st.markdown('**Logging**')
+    log_level = st.selectbox("Log level", options=["debug", "info", "warning", "error"], index=1)
+    log_file = st.text_input("Log file (optional)", value="")
+    log_remote = st.text_input("Remote log endpoint (optional)", value="")
     st.write('')
+    check = st.button("🔎 Check URLs")
     start = st.button("▶️ Start downloads")
     clear = st.button("🧹 Clear results")
 
@@ -77,18 +82,54 @@ def download_worker(urls, download_dir, max_concurrent, chunk_size, q):
     finally:
         q.put(('done', True))
 
+
+def check_worker(urls, q):
+    # Run simple checks for each URL and push results to queue
+    try:
+        for url in urls:
+            filename = os.path.basename(url) or url
+            try:
+                ok, reason = asyncio.run(is_url_downloadable(url))
+            except Exception as e:
+                ok = False
+                reason = str(e)
+            q.put(('check', filename, ok, reason))
+    except Exception as e:
+        q.put(('error', str(e)))
+    finally:
+        q.put(('check_done', True))
+
 # Start downloads when button clicked
 if start:
     urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
     if len(urls) == 0:
         st.warning("Please paste one or more URLs to download.")
     else:
+        # configure logging from UI inputs
+        configure_logging(level=log_level, log_file=log_file or None, remote_url=log_remote or None)
         os.makedirs(download_dir, exist_ok=True)
         st.session_state['queue'] = queue.Queue()
         st.session_state['files'] = {os.path.basename(u) or f"file_{i}": {'downloaded': 0, 'total': 0, 'status': 'queued', 'info': ''} for i, u in enumerate(urls)}
         st.session_state['placeholders'] = {}
         st.session_state['done'] = False
         worker = threading.Thread(target=download_worker, args=(urls, download_dir, max_concurrent, chunk_size, st.session_state['queue']), daemon=True)
+        st.session_state['worker'] = worker
+        worker.start()
+
+# Start URL checks when button clicked
+if check:
+    urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+    if len(urls) == 0:
+        st.warning("Please paste one or more URLs to check.")
+    else:
+        # configure logging from UI inputs
+        configure_logging(level=log_level, log_file=log_file or None, remote_url=log_remote or None)
+        st.session_state['queue'] = queue.Queue()
+        # Initialize file entries for display
+        st.session_state['files'] = {os.path.basename(u) or f"file_{i}": {'downloaded': 0, 'total': 0, 'status': 'queued', 'info': ''} for i, u in enumerate(urls)}
+        st.session_state['placeholders'] = {}
+        st.session_state['done'] = False
+        worker = threading.Thread(target=check_worker, args=(urls, st.session_state['queue']), daemon=True)
         st.session_state['worker'] = worker
         worker.start()
 
@@ -99,7 +140,7 @@ if clear:
     st.session_state['worker'] = None
     st.session_state['done'] = False
     st.session_state['placeholders'] = {}
-    st.experimental_rerun()
+    st.rerun()
 
 # Progress container
 progress_container = left_col.container()
@@ -132,6 +173,17 @@ if st.session_state['queue'] is not None:
             elif msg[0] == 'error':
                 _, err = msg
                 st.error(f"Worker error: {err}")
+            elif msg[0] == 'check':
+                _, filename, ok, reason = msg
+                key = filename
+                status = 'downloadable' if ok else 'not-downloadable'
+                if key not in st.session_state['files']:
+                    st.session_state['files'][key] = {'downloaded': 0, 'total': 0, 'status': status, 'info': reason}
+                else:
+                    st.session_state['files'][key]['status'] = status
+                    st.session_state['files'][key]['info'] = reason
+            elif msg[0] == 'check_done':
+                st.session_state['done'] = True
             elif msg[0] == 'done':
                 st.session_state['done'] = True
 
@@ -159,12 +211,17 @@ if st.session_state['queue'] is not None:
                         else:
                             st.write(f"{status} — {downloaded} bytes")
                     with row[1]:
-                        if info.get('status') == 'completed':
+                        status_val = info.get('status')
+                        if status_val == 'completed':
                             st.success('Done')
-                        elif info.get('status') == 'failed':
+                        elif status_val == 'failed':
                             st.error('Failed')
-                        elif info.get('status') == 'downloading':
+                        elif status_val == 'downloading':
                             st.info('Downloading')
+                        elif status_val == 'downloadable':
+                            st.markdown("<div style='background:#d4edda;padding:8px;border-radius:6px;text-align:center'>Downloadable</div>", unsafe_allow_html=True)
+                        elif status_val == 'not-downloadable':
+                            st.markdown("<div style='background:#f8d7da;padding:8px;border-radius:6px;text-align:center;color:#721c24'>Not-downloadable</div>", unsafe_allow_html=True)
                         else:
                             st.write(info.get('status'))
 
